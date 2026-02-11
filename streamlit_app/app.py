@@ -210,11 +210,23 @@ def _snowflake_query(conn: duckdb.DuckDBPyConnection, sf_sql: str, secret: str) 
     return _run_query_duckdb(conn, wrapper)
 
 
-def _sf_fetch_list(conn: duckdb.DuckDBPyConnection, sf_sql: str, secret: str) -> list[str]:
-    """Fetch a single-column list via snowflake_query()."""
+def _sf_fetch_list(conn: duckdb.DuckDBPyConnection, sf_sql: str, secret: str, col: str | int = 0) -> list[str]:
+    """Fetch a list from one column via snowflake_query().
+
+    *col* can be a column name (str) or positional index (int).
+    For SHOW commands the interesting column is usually called 'name'.
+    """
     df, _, err = _snowflake_query(conn, sf_sql, secret)
     if df is not None and not df.empty:
-        return df.iloc[:, 0].tolist()
+        if isinstance(col, str):
+            # case-insensitive column lookup
+            col_lower = col.lower()
+            for c in df.columns:
+                if c.lower() == col_lower:
+                    return df[c].dropna().astype(str).tolist()
+            # fallback: first column
+            return df.iloc[:, 0].astype(str).tolist()
+        return df.iloc[:, col].astype(str).tolist()
     return []
 
 
@@ -395,7 +407,7 @@ with tab_browser:
     st.markdown("#### Browse Snowflake Databases  *(fetched via DuckDB → Arrow ADBC)*")
 
     # ── Databases ────────────────────────────────────────────────────────────
-    databases = _sf_fetch_list(conn, "SHOW DATABASES", secret)
+    databases = _sf_fetch_list(conn, "SHOW DATABASES", secret, col="name")
     if not databases:
         st.warning("No databases found (check privileges or connection).")
         st.stop()
@@ -515,8 +527,9 @@ with tab_query:
         "SHOW WAREHOUSES": "SHOW WAREHOUSES",
         "SHOW DATABASES": "SHOW DATABASES",
         "Session Info": "SELECT CURRENT_USER() AS U, CURRENT_ROLE() AS R, "
-                        "CURRENT_WAREHOUSE() AS WH, CURRENT_DATABASE() AS DB",
-        "Table Sample": f"SELECT * FROM {table_ref} SAMPLE (100 ROWS)",
+                        "CURRENT_WAREHOUSE() AS WH, CURRENT_DATABASE() AS DB, "
+                        "CURRENT_SCHEMA() AS SCHEMA",
+        "Table Sample": f"SELECT * FROM {table_ref} LIMIT 100",
     }
     for idx, (lbl, snip) in enumerate(helpers.items()):
         with hc[idx]:
@@ -595,12 +608,20 @@ with tab_local:
         "cross-database joins between Snowflake and local data, etc."
     )
 
-    lc = st.columns(4)
+    lc = st.columns(5)
     local_helpers = {
-        "DuckDB Version": "SELECT version() AS duckdb_version;",
-        "List Secrets": "SELECT name, type, provider FROM duckdb_secrets() WHERE type = 'snowflake';",
-        "List Tables": "SHOW ALL TABLES;",
-        "Snowflake Ext": "SELECT snowflake_version();",
+        "DuckDB Version": "SELECT version() AS duckdb_version",
+        "List Secrets": "SELECT name, type, provider FROM duckdb_secrets() WHERE type = 'snowflake'",
+        "Local Tables": "SHOW ALL TABLES",
+        "Snowflake Ext": "SELECT snowflake_version()",
+        "SF → Local": (
+            f"CREATE OR REPLACE TABLE sample_data AS\n"
+            f"SELECT * FROM snowflake_query(\n"
+            f"    'SELECT * FROM {table_ref} LIMIT 500',\n"
+            f"    '{secret}'\n)"
+            if st.session_state.current_table
+            else "-- Select a table in Browser tab first"
+        ),
     }
     for idx, (lbl, snip) in enumerate(local_helpers.items()):
         with lc[idx]:
@@ -641,8 +662,8 @@ COPY local_customers TO '/tmp/customers.parquet' (FORMAT PARQUET);""",
         local_run = st.button("▶️ Run", type="primary", use_container_width=True, key="local_run_btn")
 
     if local_run and local_sql.strip():
-        # Support multiple statements separated by ;
-        statements = [s.strip() for s in local_sql.strip().split(";") if s.strip()]
+        # Support multiple statements separated by ;  (naive split, good enough for simple cases)
+        statements = [s.strip() for s in local_sql.strip().rstrip(";").split(";") if s.strip()]
         for stmt in statements:
             with st.spinner(f"Executing: {stmt[:60]}…"):
                 df, elapsed, err = _run_query_duckdb(conn, stmt)
